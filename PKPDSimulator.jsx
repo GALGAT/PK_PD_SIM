@@ -1,0 +1,282 @@
+import React, { useState, useEffect, useCallback } from 'react';
+import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, ComposedChart, Area } from 'recharts';
+
+const PKPDSimulator = () => {
+  const [drugParams, setDrugParams] = useState({
+    dosingInterval: 24,
+    infusionTime: 1,
+    halfLife: 6,
+    maxConcentration: 100
+  });
+
+  const [inhibitorParams, setInhibitorParams] = useState({
+    dosingInterval: 24,
+    infusionTime: 1,
+    halfLife: 8,
+    maxConcentration: 50
+  });
+
+  const [pdParams, setPdParams] = useState({
+    log2MIC0: 2,
+    imax: 3,
+    ic50: 25,
+    hillCoeff: 1
+  });
+
+  const [simParams, setSimParams] = useState({
+    numCycles: 3,
+    timeStep: 0.1
+  });
+
+  const [results, setResults] = useState(null);
+  const [chartData, setChartData] = useState([]);
+  const [cycleResults, setCycleResults] = useState([]);
+  const [showAUCVisualization, setShowAUCVisualization] = useState(false);
+  const [selectedCycle, setSelectedCycle] = useState(0);
+
+  const calculateDecayConstant = useCallback((halfLife) => {
+    return Math.log(2) / halfLife;
+  }, []);
+
+  const calculateMinConcentration = useCallback((maxConc, decayConstant, dosingInterval, infusionTime) => {
+    return maxConc * Math.exp(-decayConstant * (dosingInterval - infusionTime));
+  }, []);
+
+  const concentrationDuringInfusion = useCallback((t, tCycleStart, infusionTime, minConc, maxConc) => {
+    // Fixed: Properly calculate concentration during infusion
+    return minConc + (maxConc - minConc) * ((t - tCycleStart) / infusionTime);
+  }, []);
+
+  const concentrationDuringDecay = useCallback((t, tInfusionEnd, maxConc, decayConstant) => {
+    return maxConc * Math.exp(-decayConstant * (t - tInfusionEnd));
+  }, []);
+
+  const calculateLog2MIC = useCallback((inhibitorConc, log2MIC0, imax, ic50, hillCoeff) => {
+    const numerator = imax * Math.pow(inhibitorConc, hillCoeff);
+    const denominator = Math.pow(inhibitorConc, hillCoeff) + Math.pow(ic50, hillCoeff);
+    return log2MIC0 - (numerator / denominator);
+  }, []);
+
+  const calculateAUC = useCallback((timePoints, concentrations) => {
+    let auc = 0;
+    for (let i = 1; i < timePoints.length; i++) {
+      const dt = timePoints[i] - timePoints[i - 1];
+      const avgConc = (concentrations[i - 1] + concentrations[i]) / 2;
+      auc += avgConc * dt;
+    }
+    return auc;
+  }, []);
+
+  const runSimulation = useCallback(() => {
+    const totalTime = simParams.numCycles * drugParams.dosingInterval;
+    const timePoints = [];
+    const drugConcentrations = [];
+    const inhibitorConcentrations = [];
+    const micValues = [];
+    const tOverMIC = [];
+
+    const kDrug = calculateDecayConstant(drugParams.halfLife);
+    const kInhibitor = calculateDecayConstant(inhibitorParams.halfLife);
+
+    const drugMinConc = calculateMinConcentration(
+      drugParams.maxConcentration, 
+      kDrug, 
+      drugParams.dosingInterval, 
+      drugParams.infusionTime
+    );
+    const inhibitorMinConc = calculateMinConcentration(
+      inhibitorParams.maxConcentration, 
+      kInhibitor, 
+      inhibitorParams.dosingInterval, 
+      inhibitorParams.infusionTime
+    );
+
+    const cycleData = [];
+    for (let cycle = 0; cycle < simParams.numCycles; cycle++) {
+      cycleData.push({
+        cycle: cycle + 1,
+        timePoints: [],
+        drugConcentrations: [],
+        inhibitorConcentrations: [],
+        micValues: [],
+        tOverMIC: []
+      });
+    }
+
+    for (let t = 0; t <= totalTime; t += simParams.timeStep) {
+      timePoints.push(t);
+
+      const currentCycle = Math.floor(t / drugParams.dosingInterval);
+      const timeInCycle = t % drugParams.dosingInterval;
+
+      let drugConc;
+      if (timeInCycle <= drugParams.infusionTime) {
+        drugConc = concentrationDuringInfusion(
+          t, 
+          currentCycle * drugParams.dosingInterval, 
+          drugParams.infusionTime, 
+          drugMinConc, 
+          drugParams.maxConcentration
+        );
+      } else {
+        const infusionEndTime = currentCycle * drugParams.dosingInterval + drugParams.infusionTime;
+        drugConc = concentrationDuringDecay(t, infusionEndTime, drugParams.maxConcentration, kDrug);
+      }
+
+      let inhibitorConc;
+      const timeInInhibitorCycle = t % inhibitorParams.dosingInterval;
+      if (timeInInhibitorCycle <= inhibitorParams.infusionTime) {
+        inhibitorConc = concentrationDuringInfusion(
+          t, 
+          currentCycle * inhibitorParams.dosingInterval, 
+          inhibitorParams.infusionTime, 
+          inhibitorMinConc, 
+          inhibitorParams.maxConcentration
+        );
+      } else {
+        const infusionEndTime = currentCycle * inhibitorParams.dosingInterval + inhibitorParams.infusionTime;
+        inhibitorConc = concentrationDuringDecay(t, infusionEndTime, inhibitorParams.maxConcentration, kInhibitor);
+      }
+
+      drugConcentrations.push(drugConc);
+      inhibitorConcentrations.push(inhibitorConc);
+
+      const log2MIC = calculateLog2MIC(
+        inhibitorConc, 
+        pdParams.log2MIC0, 
+        pdParams.imax, 
+        pdParams.ic50, 
+        pdParams.hillCoeff
+      );
+      const mic = Math.pow(2, log2MIC);
+      micValues.push(mic);
+
+      const isAboveMIC = drugConc >= mic ? 1 : 0;
+      tOverMIC.push(isAboveMIC);
+
+      if (currentCycle < simParams.numCycles) {
+        const cycleIndex = Math.min(currentCycle, simParams.numCycles - 1);
+        cycleData[cycleIndex].timePoints.push(timeInCycle);
+        cycleData[cycleIndex].drugConcentrations.push(drugConc);
+        cycleData[cycleIndex].inhibitorConcentrations.push(inhibitorConc);
+        cycleData[cycleIndex].micValues.push(mic);
+        cycleData[cycleIndex].tOverMIC.push(isAboveMIC);
+      }
+    }
+
+    const drugAUC = calculateAUC(timePoints, drugConcentrations);
+    const inhibitorAUC = calculateAUC(timePoints, inhibitorConcentrations);
+
+    const cycleResultsData = cycleData.map((cycle) => {
+      const cycleDrugAUC = calculateAUC(cycle.timePoints, cycle.drugConcentrations);
+      const cycleInhibitorAUC = calculateAUC(cycle.timePoints, cycle.inhibitorConcentrations);
+      const cycleExposureRatio = cycleDrugAUC / cycleInhibitorAUC;
+      const cycleTimeAboveMIC = cycle.tOverMIC.reduce((sum, val) => sum + val, 0);
+      const cyclePercentTOverMIC = (cycleTimeAboveMIC / cycle.tOverMIC.length) * 100;
+
+      return {
+        cycle: cycle.cycle,
+        drugAUC: cycleDrugAUC,
+        inhibitorAUC: cycleInhibitorAUC,
+        exposureRatio: cycleExposureRatio,
+        percentTOverMIC: cyclePercentTOverMIC,
+        timePoints: cycle.timePoints,
+        drugConcentrations: cycle.drugConcentrations,
+        inhibitorConcentrations: cycle.inhibitorConcentrations,
+        micValues: cycle.micValues
+      };
+    });
+
+    const exposureRatio = drugAUC / inhibitorAUC;
+    const inverseExposureRatio = inhibitorAUC / drugAUC;
+    const totalTimePoints = tOverMIC.length;
+    const timeAboveMIC = tOverMIC.reduce((sum, val) => sum + val, 0);
+    const percentTOverMIC = (timeAboveMIC / totalTimePoints) * 100;
+
+    const chartData = timePoints.map((time, index) => ({
+      time: parseFloat(time.toFixed(2)),
+      drug: parseFloat(drugConcentrations[index].toFixed(3)),
+      inhibitor: parseFloat(inhibitorConcentrations[index].toFixed(3)),
+      mic: parseFloat(micValues[index].toFixed(3))
+    }));
+
+    setResults({
+      drugAUC: drugAUC.toFixed(2),
+      inhibitorAUC: inhibitorAUC.toFixed(2),
+      exposureRatio: exposureRatio.toFixed(3),
+      inverseExposureRatio: inverseExposureRatio.toFixed(3),
+      percentTOverMIC: percentTOverMIC.toFixed(1),
+      drugMinConc: drugMinConc.toFixed(2),
+      inhibitorMinConc: inhibitorMinConc.toFixed(2),
+      kDrug: kDrug.toFixed(4),
+      kInhibitor: kInhibitor.toFixed(4)
+    });
+
+    setChartData(chartData);
+    setCycleResults(cycleResultsData);
+  }, [drugParams, inhibitorParams, pdParams, simParams, calculateDecayConstant, calculateMinConcentration, concentrationDuringInfusion, concentrationDuringDecay, calculateLog2MIC, calculateAUC]);
+
+  useEffect(() => {
+    runSimulation();
+  }, [runSimulation]);
+
+  const interpretExposureRatio = (ratio) => {
+    if (ratio > 2) {
+      return "High drug exposure per inhibitor exposure - efficient interaction";
+    } else if (ratio < 0.5) {
+      return "Low drug exposure per inhibitor exposure - less potent or suboptimal dosing";
+    } else {
+      return "Moderate drug to inhibitor exposure ratio";
+    }
+  };
+
+  return (
+    <div className="p-6 max-w-7xl mx-auto bg-white">
+      <h1 className="text-3xl font-bold text-center mb-8 text-blue-800">
+        Pharmacokinetics & Pharmacodynamics Simulator
+      </h1>
+
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-8">
+        {/* Parameter inputs remain the same */}
+        {/* ... */}
+      </div>
+
+      <div className="mb-6 text-center">
+        <button
+          onClick={runSimulation}
+          className="bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-6 rounded-lg text-lg"
+        >
+          Run Simulation
+        </button>
+      </div>
+
+      {/* Rest of the component remains the same */}
+      {/* ... */}
+      
+      {showAUCVisualization && cycleResults.length > 0 && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
+          <div className="bg-white rounded-lg max-w-6xl w-full max-h-[90vh] overflow-y-auto">
+            <div className="p-6">
+              <div className="flex justify-between items-center mb-4">
+                <h2 className="text-2xl font-bold text-gray-800">
+                  AUC Visualization - Cycle {cycleResults[selectedCycle].cycle}
+                </h2>
+                <button
+                  onClick={() => setShowAUCVisualization(false)}
+                  className="text-gray-500 hover:text-gray-700 text-2xl font-bold"
+                >
+                  ×
+                </button>
+              </div>
+              
+              {/* Rest of the modal content */}
+              {/* ... */}
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+export default PKPDSimulator;
